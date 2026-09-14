@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AI Assistant</title>
+  <title>GigaChat Assistant</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -175,7 +175,7 @@
       color: var(--chat-text); font-size: 13px; font-family: inherit; outline: none;
     }
     .settings-field input:focus, .settings-field select:focus { border-color: var(--chat-primary); }
-    .settings-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+    .settings-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 16px; }
     .settings-actions button {
       padding: 8px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; border: none;
     }
@@ -252,7 +252,7 @@
         <circle cx="15" cy="14" r="1.5" fill="currentColor"/>
       </svg>
       <button id="conv-selector" class="conv-selector" title="Switch conversation">
-        <span id="conv-selector-title">AI Assistant</span>
+        <span id="conv-selector-title">GigaChat Assistant</span>
         <span class="conv-selector-arrow">▼</span>
       </button>
       <span id="model-badge" style="font-size:10px;color:var(--chat-text-muted);font-weight:400;"></span>
@@ -277,19 +277,16 @@
   <!-- Settings Modal -->
   <div id="settings-overlay" class="settings-overlay hidden">
     <div class="settings-panel">
-      <h3>⚙️ AI Assistant Settings</h3>
+      <h3>⚙️ GigaChat Settings</h3>
       <div class="settings-field">
-        <label>API Key *</label>
-        <input type="password" id="cfg-apiKey" placeholder="sk-..." />
-      </div>
-      <div class="settings-field">
-        <label>Base URL</label>
-        <input type="text" id="cfg-baseUrl" placeholder="https://api.openai.com/v1" />
-        <div class="model-info">OpenAI-compatible endpoint (include /v1 if needed)</div>
+        <label>GigaChat Authorization Key *</label>
+        <input type="password" id="cfg-authKey" placeholder="Base64 key from GigaChat API project" autocomplete="off" />
+        <div class="model-info">Stored only on this device. Leave blank to keep the saved key.</div>
       </div>
       <div class="settings-field">
         <label>Model</label>
-        <input type="text" id="cfg-model" placeholder="gpt-4o" />
+        <select id="cfg-model" disabled><option value="">Check the key to load models</option></select>
+        <div class="model-info" id="cfg-connection-status" role="status" aria-live="polite"></div>
       </div>
       <div class="settings-field">
         <label>Max Tokens</label>
@@ -301,6 +298,7 @@
       </div>
       <div class="settings-actions">
         <button class="btn-cancel" id="settings-cancel">Cancel</button>
+        <button class="btn-cancel" id="settings-test" type="button">Check key / Refresh models</button>
         <button class="btn-save" id="settings-save">Save</button>
       </div>
     </div>
@@ -311,6 +309,11 @@
     var CONFIG_KEY = 'ai-assistant-config';
     var CONVERSATIONS_KEY = 'ai-assistant-conversations';
     var OLD_CONV_KEY = 'ai-assistant-conversation';
+    var MIGRATION_KEY = 'gigachat-migration-v1';
+    var OAUTH_URL = 'https://api.giga.chat/api/v2/oauth';
+    var LEGACY_OAUTH_URL = 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth';
+    var CHAT_URL = 'https://api.giga.chat/v1/chat/completions';
+    var MODELS_URL = 'https://api.giga.chat/v1/models';
     var MAX_CONVERSATIONS = 20;
     var MAX_MESSAGES = 50;
     var config = null;
@@ -318,6 +321,43 @@
     var messages = [];          // live reference to active conversation's messages
     var isProcessing = false;
     var currentTaskId = null;
+    var hasAuthKey = false;
+    var accessToken = null;
+    var expiresAt = 0;
+    var tokenRefreshPromise = null;
+    var oauthUsesLegacy = false;
+    var availableModels = [];
+    var settingsVerified = null;
+    var settingsCheckPromise = null;
+    var settingsCheckTimer = null;
+
+    function isDesktopTransportAvailable() {
+      if (typeof PluginAPI.executeNodeScript !== 'function' || typeof window === 'undefined') return false;
+      try { return !!(window.parent && window.parent.ea); }
+      catch (e) { return false; }
+    }
+
+    function getSecretBridge() {
+      var bridge;
+      try { bridge = window.parent && window.parent.__gigachatAssistantSecretBridge; }
+      catch (e) { bridge = null; }
+      if (!bridge || typeof bridge.get !== 'function' || typeof bridge.set !== 'function') {
+        throw new Error('GigaChat secret storage is unavailable. Reload or update Super Productivity desktop.');
+      }
+      return bridge;
+    }
+
+    async function migrateLegacyData() {
+      var raw = await PluginAPI.loadSyncedData();
+      if (!raw) return;
+      var data = JSON.parse(raw);
+      if (!data || data[MIGRATION_KEY]) return;
+      delete data[CONFIG_KEY];
+      delete data[CONVERSATIONS_KEY];
+      delete data[OLD_CONV_KEY];
+      data[MIGRATION_KEY] = true;
+      await PluginAPI.persistDataSynced(JSON.stringify(data));
+    }
 
     // ==================== CONFIG PERSISTENCE ====================
     async function loadConfig() {
@@ -338,17 +378,13 @@
     }
 
     async function saveConfig(cfg) {
+      var raw = await PluginAPI.loadSyncedData();
+      var data = raw ? JSON.parse(raw) : {};
+      data[CONFIG_KEY] = cfg;
+      data[MIGRATION_KEY] = true;
+      await PluginAPI.persistDataSynced(JSON.stringify(data));
       config = cfg;
-      try {
-        var raw = await PluginAPI.loadSyncedData();
-        var data = {};
-        if (raw) { try { data = JSON.parse(raw); } catch(e) {} }
-        data[CONFIG_KEY] = cfg;
-        await PluginAPI.persistDataSynced(JSON.stringify(data));
-        updateModelBadge();
-      } catch (e) {
-        console.error('[AI] saveConfig error:', e);
-      }
+      updateModelBadge();
     }
 
     // ==================== CONVERSATION PERSISTENCE ====================
@@ -370,12 +406,20 @@
       return false;
     }
 
+    function trimMessages(history) {
+      var trimmed = history.slice(-MAX_MESSAGES);
+      while (trimmed.length && trimmed[0].role === 'function') trimmed.shift();
+      if (trimmed.length && trimmed[0].function_call &&
+          (!trimmed[1] || trimmed[1].role !== 'function')) trimmed.shift();
+      return trimmed;
+    }
+
     async function saveConversations() {
       if (!conversations) return;
       // Sync messages back to active conversation
       var active = getActiveConv();
       if (active) {
-        active.messages = messages.slice(-MAX_MESSAGES);
+        active.messages = trimMessages(messages);
         active.updatedAt = Date.now();
       }
       try {
@@ -427,7 +471,7 @@
       // Save current messages to active conv
       var cur = getActiveConv();
       if (cur) {
-        cur.messages = messages.slice(-MAX_MESSAGES);
+        cur.messages = trimMessages(messages);
         cur.updatedAt = Date.now();
       }
       conversations.activeId = id;
@@ -482,33 +526,6 @@
       }
     }
 
-    async function migrateOldFormat() {
-      try {
-        var raw = await PluginAPI.loadSyncedData();
-        if (!raw) return;
-        var data = JSON.parse(raw);
-        // Only migrate if new format doesn't exist and old format does
-        if (!data[CONVERSATIONS_KEY] && data[OLD_CONV_KEY] && data[OLD_CONV_KEY].length > 0) {
-          var oldMessages = data[OLD_CONV_KEY];
-          conversations = {
-            activeId: 'conv_migrated',
-            list: [{
-              id: 'conv_migrated',
-              title: 'Previous Chat',
-              createdAt: Date.now(),
-              updatedAt: Date.now(),
-              messages: oldMessages.slice(-MAX_MESSAGES)
-            }]
-          };
-          messages = conversations.list[0].messages;
-          data[CONVERSATIONS_KEY] = conversations;
-          delete data[OLD_CONV_KEY];
-          await PluginAPI.persistDataSynced(JSON.stringify(data));
-          console.log('[AI] Migrated old conversation format to multi-conversation');
-        }
-      } catch (e) { console.warn('[AI] migrateOldFormat error:', e); }
-    }
-
     function renderAllMessages() {
       var container = document.getElementById('chat-container');
       container.innerHTML = '';
@@ -524,35 +541,121 @@
     }
 
     // ==================== SETTINGS UI ====================
+    function setSettingsStatus(message) {
+      document.getElementById('cfg-connection-status').textContent = message;
+    }
+
+    function renderModelOptions(models, preferred) {
+      var select = document.getElementById('cfg-model');
+      select.innerHTML = '';
+      var choices = models.slice();
+      if (!choices.length && preferred) choices.push(preferred);
+      if (!choices.length) {
+        var empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = 'Check the key to load models';
+        select.appendChild(empty);
+        select.disabled = true;
+        return;
+      }
+      choices.forEach(function(name) {
+        var option = document.createElement('option');
+        option.value = name;
+        option.textContent = name;
+        select.appendChild(option);
+      });
+      select.disabled = false;
+      select.value = choices.indexOf(preferred) !== -1 ? preferred : choices[0];
+    }
+
+    async function checkSettingsKey(force) {
+      var key = document.getElementById('cfg-authKey').value.trim().replace(/^Basic\s+/i, '');
+      if (!key && !hasAuthKey) throw new Error('Enter a GigaChat Authorization Key first.');
+      if (!force && settingsVerified && settingsVerified.key === key) return settingsVerified;
+      if (settingsCheckPromise && settingsCheckPromise.key === key) return settingsCheckPromise.promise;
+      setSettingsStatus('Checking key and loading available models…');
+      var promise = (async function() {
+        var result = await loadAvailableModels(key || null);
+        if (document.getElementById('cfg-authKey').value.trim().replace(/^Basic\s+/i, '') === key) {
+          settingsVerified = {key:key, token:result.token, expiresAt:result.expiresAt, models:result.models};
+          availableModels = result.models;
+          renderModelOptions(availableModels, document.getElementById('cfg-model').value || (config && config.model));
+          setSettingsStatus('Key works. ' + availableModels.length + ' model(s) available.');
+        }
+        return result;
+      })();
+      settingsCheckPromise = {key:key,promise:promise};
+      try { return await promise; }
+      catch (e) {
+        if (document.getElementById('cfg-authKey').value.trim().replace(/^Basic\s+/i, '') === key) {
+          setSettingsStatus(e.message);
+        }
+        throw e;
+      } finally {
+        if (settingsCheckPromise && settingsCheckPromise.promise === promise) settingsCheckPromise = null;
+      }
+    }
+
     function openSettings() {
-      document.getElementById('cfg-apiKey').value = (config && config.apiKey) || '';
-      document.getElementById('cfg-baseUrl').value = (config && config.baseUrl) || 'https://api.openai.com/v1';
-      document.getElementById('cfg-model').value = (config && config.model) || 'gpt-4o';
+      if (!isDesktopTransportAvailable()) { showDesktopWarning(); return; }
+      document.getElementById('cfg-authKey').value = '';
+      settingsVerified = null;
+      renderModelOptions(availableModels, config && config.model);
+      setSettingsStatus(hasAuthKey ? 'Loading available models…' : 'Enter a key to load available models.');
       document.getElementById('cfg-maxTokens').value = (config && config.maxTokens) || 4096;
       document.getElementById('cfg-temperature').value = (config && config.temperature !== undefined) ? config.temperature : 0.7;
       document.getElementById('settings-overlay').classList.remove('hidden');
+      if (hasAuthKey) checkSettingsKey(false).catch(function() {});
     }
 
     function closeSettings() {
+      if (settingsCheckTimer) clearTimeout(settingsCheckTimer);
+      settingsVerified = null;
       document.getElementById('settings-overlay').classList.add('hidden');
     }
 
-    function doSaveSettings() {
+    async function doSaveSettings() {
+      if (!isDesktopTransportAvailable()) {
+        closeSettings();
+        showDesktopWarning();
+        return;
+      }
+      if (settingsCheckTimer) clearTimeout(settingsCheckTimer);
+      var key = document.getElementById('cfg-authKey').value.trim().replace(/^Basic\s+/i,'');
+      if (!key && !hasAuthKey) {
+        setSettingsStatus('GigaChat Authorization Key is required.');
+        return;
+      }
+      var verified = settingsVerified && settingsVerified.key === key ? settingsVerified : null;
+      if (key && !verified) {
+        try { await checkSettingsKey(false); verified = settingsVerified; }
+        catch (e) { return; }
+      }
       var cfg = {
-        apiKey: document.getElementById('cfg-apiKey').value.trim(),
-        baseUrl: document.getElementById('cfg-baseUrl').value.trim() || 'https://api.openai.com/v1',
-        model: document.getElementById('cfg-model').value.trim() || 'gpt-4o',
+        model: document.getElementById('cfg-model').value || (config && config.model) || 'GigaChat',
         maxTokens: parseInt(document.getElementById('cfg-maxTokens').value) || 4096,
         temperature: parseFloat(document.getElementById('cfg-temperature').value),
       };
       if (isNaN(cfg.temperature)) cfg.temperature = 0.7;
-
-      if (!cfg.apiKey) {
-        alert('API Key is required');
+      if (key) {
+        try {
+          var secretBridge = getSecretBridge();
+          await secretBridge.set(key);
+          if ((await secretBridge.get()) !== key) throw new Error('Secret not stored');
+          hasAuthKey = true;
+          accessToken = verified.token;
+          expiresAt = verified.expiresAt;
+        } catch (e) {
+          setSettingsStatus('Could not store the Authorization Key locally. Check your Super Productivity desktop version.');
+          return;
+        }
+      }
+      try {
+        await saveConfig(cfg);
+      } catch (e) {
+        setSettingsStatus('Could not save GigaChat preferences. Check plugin data storage.');
         return;
       }
-
-      saveConfig(cfg);
       closeSettings();
 
       // Refresh the view
@@ -562,7 +665,7 @@
       } else {
         showWelcome();
       }
-      showSnack('Settings saved!');
+      showSnack('GigaChat settings saved!');
     }
 
     function updateModelBadge() {
@@ -923,26 +1026,208 @@
       } catch(e) { return '{"error":"'+e.message+'"}'; }
     }
 
-    // ==================== OPENAI API ====================
-    async function callOpenAI(msgs) {
-      var baseUrl = (config.baseUrl||'https://api.openai.com/v1').replace(/\/+$/,'');
-      var sys = BASE_SYSTEM_PROMPT;
-      var full = [{role:'system',content:sys}].concat(msgs);
-      var resp = await fetch(baseUrl+'/chat/completions',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','Authorization':'Bearer '+config.apiKey},
-        body:JSON.stringify({model:config.model||'gpt-4o',messages:full,tools:tools,tool_choice:'auto',max_tokens:config.maxTokens||4096,temperature:config.temperature!==undefined?config.temperature:0.7})
+    // ==================== GIGACHAT API ====================
+    function safeTransportError(error, credential) {
+      var detail = typeof error === 'string' ? error : '';
+      if (detail.charAt(0) === '{') {
+        try {
+          var parsed = JSON.parse(detail);
+          if (typeof parsed.__error === 'string') detail = parsed.__error;
+        } catch (e) {}
+      }
+      if (credential) detail = detail.split(credential).join('[redacted]');
+      detail = detail.replace(/(?:Bearer|Basic)\s+\S+/gi, '[redacted]')
+        .replace(/[A-Za-z0-9+/_=-]{32,}/g, '[redacted]')
+        .replace(/[\r\n]+/g, ' ').slice(0, 220);
+      if (!detail) detail = 'Node execution did not return a result.';
+      if (/permission|denied|grant|consent|разрешени|доступ/i.test(detail)) {
+        detail += ' Re-enable the plugin and allow nodeExecution in the desktop prompt.';
+      }
+      if (/CERT|certificate|issuer/i.test(detail)) {
+        detail += ' Check the trusted root certificates in your operating system.';
+      }
+      return new Error('GigaChat desktop request failed: ' + detail);
+    }
+
+    async function nodeRequest(kind, credential, body) {
+      if (!isDesktopTransportAvailable()) {
+        throw new Error('GigaChat is available only in Super Productivity desktop.');
+      }
+      var request = {kind:kind,credential:credential,body:body};
+      // Pass credentials and chat content as arguments, not executable source.
+      var script = 'const request = args[0];\n' +
+        "const https = require('https');\n" +
+        "const tls = require('tls');\n" +
+        "const ca = typeof tls.getCACertificates === 'function' ? tls.getCACertificates('default').concat(tls.getCACertificates('system')) : tls.rootCertificates;\n" +
+        "const isOauth = request.kind === 'oauth' || request.kind === 'oauth-legacy';\n" +
+        "const url = request.kind === 'oauth' ? '" + OAUTH_URL + "' : request.kind === 'oauth-legacy' ? '" + LEGACY_OAUTH_URL + "' : request.kind === 'models' ? '" + MODELS_URL + "' : '" + CHAT_URL + "';\n" +
+        "const headers = isOauth ? {\n" +
+        "  'Content-Type':'application/x-www-form-urlencoded', 'Accept':'application/json',\n" +
+        "  'Authorization':'Basic '+request.credential, 'RqUID':require('crypto').randomUUID()\n" +
+        "} : {'Accept':'application/json','Authorization':'Bearer '+request.credential};\n" +
+        "headers['User-Agent'] = 'SuperProductivity-GigaChat-Assistant';\n" +
+        "if (request.kind === 'chat') headers['Content-Type'] = 'application/json';\n" +
+        "return new Promise((resolve,reject) => {\n" +
+        "  const req = https.request(url,{method:request.kind === 'models' ? 'GET' : 'POST',headers:headers,ca:ca,timeout:30000},res => {\n" +
+        "    let text = ''; res.setEncoding('utf8');\n" +
+        "    res.on('data',chunk => { text += chunk; if(text.length > 2000000) req.destroy(new Error('Response too large')); });\n" +
+        "    res.on('end',() => resolve({status:res.statusCode,body:text}));\n" +
+        "  });\n" +
+        "  req.on('timeout',() => req.destroy(new Error('Request timed out')));\n" +
+        "  req.on('error',reject); req.end(request.kind === 'models' ? undefined : request.body);\n" +
+        "});";
+      var result;
+      try { result = await PluginAPI.executeNodeScript({script:script,args:[request],timeout:45000}); }
+      catch (e) { throw safeTransportError(e && e.message, credential); }
+      if (!result || !result.success || !result.result) {
+        throw safeTransportError(result && result.error, credential);
+      }
+      return result.result;
+    }
+
+    function parseGigaChatResponse(reply, label) {
+      if (reply.status < 200 || reply.status >= 300) {
+        if (reply.status === 403 && /^\s*</.test(reply.body || '')) {
+          throw new Error(label + ' gateway rejected the request (HTTP 403) before key validation. Check endpoint access.');
+        }
+        if (reply.status === 401 || reply.status === 403) {
+          throw new Error(label + ' failed (HTTP ' + reply.status + '). Check the Authorization Key and PERS access.');
+        }
+        if (reply.status === 429) throw new Error(label + ' rate limit reached (HTTP 429). Try again later.');
+        throw new Error(label + ' failed (HTTP ' + reply.status + ').');
+      }
+      try { return JSON.parse(reply.body); }
+      catch (e) { throw new Error(label + ' returned invalid JSON.'); }
+    }
+
+    async function requestAccessToken(key) {
+      var reply = await nodeRequest(oauthUsesLegacy ? 'oauth-legacy' : 'oauth', key, 'scope=GIGACHAT_API_PERS');
+      if (!oauthUsesLegacy && reply.status === 403 && /^\s*</.test(reply.body || '')) {
+        reply = await nodeRequest('oauth-legacy', key, 'scope=GIGACHAT_API_PERS');
+        if (reply.status >= 200 && reply.status < 300) oauthUsesLegacy = true;
+      }
+      var data = parseGigaChatResponse(reply, 'GigaChat OAuth');
+      var expiry = Number(data.expires_at);
+      if (expiry < 1e12) expiry *= 1000; // API samples use epoch seconds.
+      if (!data.access_token || !Number.isFinite(expiry) || expiry <= Date.now()) {
+        throw new Error('GigaChat OAuth returned an invalid token or expiry.');
+      }
+      return {token:data.access_token, expiresAt:expiry};
+    }
+
+    async function getAccessToken() {
+      if (accessToken && Date.now() + 60000 < expiresAt) return accessToken;
+      if (tokenRefreshPromise) return tokenRefreshPromise;
+      tokenRefreshPromise = (async function() {
+        var key = await getSecretBridge().get();
+        if (!key) throw new Error('GigaChat Authorization Key is missing in this device.');
+        var data = await requestAccessToken(key);
+        accessToken = data.token;
+        expiresAt = data.expiresAt;
+        return accessToken;
+      })();
+      try { return await tokenRefreshPromise; }
+      finally { tokenRefreshPromise = null; }
+    }
+
+    function parseAvailableModels(data) {
+      if (!data || !Array.isArray(data.data)) throw new Error('GigaChat models returned an invalid list.');
+      var names = [];
+      data.data.forEach(function(item) {
+        if (item && typeof item.id === 'string' && item.id &&
+            (!item.type || item.type === 'chat') && names.indexOf(item.id) === -1) names.push(item.id);
       });
-      if(!resp.ok){var t=await resp.text(); throw new Error('API '+resp.status+': '+t.slice(0,300));}
-      var data=await resp.json();
-      if(data.error) throw new Error(data.error.message||JSON.stringify(data.error));
+      if (!names.length) throw new Error('No chat models are available for this key.');
+      return names;
+    }
+
+    async function loadAvailableModels(key) {
+      var tokenData = key ? await requestAccessToken(key) : {token:await getAccessToken(),expiresAt:expiresAt};
+      var reply = await nodeRequest('models', tokenData.token);
+      if (reply.status === 401) {
+        if (!key && accessToken === tokenData.token) { accessToken = null; expiresAt = 0; }
+        tokenData = key ? await requestAccessToken(key) : {token:await getAccessToken(),expiresAt:expiresAt};
+        reply = await nodeRequest('models', tokenData.token);
+      }
+      var data = parseGigaChatResponse(reply, 'GigaChat models');
+      return {models:parseAvailableModels(data),token:tokenData.token,expiresAt:tokenData.expiresAt};
+    }
+
+    async function callGigaChat(msgs) {
+      var full = [{role:'system',content:BASE_SYSTEM_PROMPT}].concat(msgs);
+      var body = JSON.stringify({
+        model:config.model||'GigaChat',messages:full,
+        functions:tools.map(function(t){return t.function;}),function_call:'auto',
+        max_tokens:config.maxTokens||4096,
+        temperature:config.temperature!==undefined?config.temperature:0.7
+      });
+      var token = await getAccessToken();
+      var reply = await nodeRequest('chat', token, body);
+      if (reply.status === 401) {
+        if (accessToken === token) { accessToken = null; expiresAt = 0; }
+        token = await getAccessToken();
+        reply = await nodeRequest('chat', token, body);
+      }
+      var data = parseGigaChatResponse(reply, 'GigaChat chat');
+      if (data.error) throw new Error('GigaChat chat returned an API error.');
       return data;
+    }
+
+    function parseFunctionArguments(call) {
+      var definition = tools.find(function(t){return call && t.function.name===call.name;});
+      if (!definition) {
+        throw new Error('GigaChat requested an unknown function.');
+      }
+      var args = call.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); }
+        catch (e) { throw new Error('GigaChat returned invalid function arguments.'); }
+      }
+      if (!matchesFunctionSchema(args, definition.function.parameters)) {
+        throw new Error('GigaChat returned invalid function arguments.');
+      }
+      return args;
+    }
+
+    function matchesFunctionSchema(value, schema) {
+      if (!schema) return true;
+      if (schema.enum && schema.enum.indexOf(value) === -1) return false;
+      if (schema.type === 'object') {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+        var required = schema.required || [];
+        for (var i = 0; i < required.length; i++) {
+          if (!Object.prototype.hasOwnProperty.call(value, required[i])) return false;
+        }
+        var properties = schema.properties || {};
+        for (var name in properties) {
+          if (Object.prototype.hasOwnProperty.call(value, name) &&
+              !matchesFunctionSchema(value[name], properties[name])) return false;
+        }
+      } else if (schema.type === 'array') {
+        if (!Array.isArray(value)) return false;
+        for (var j = 0; j < value.length; j++) {
+          if (!matchesFunctionSchema(value[j], schema.items)) return false;
+        }
+      } else if (schema.type === 'string' && typeof value !== 'string') return false;
+      else if (schema.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) return false;
+      else if (schema.type === 'integer' && !Number.isInteger(value)) return false;
+      else if (schema.type === 'boolean' && typeof value !== 'boolean') return false;
+      return true;
+    }
+
+    function serializeFunctionResult(result) {
+      var payload = result && typeof result === 'object' && !Array.isArray(result)
+        ? result : {result:result===undefined ? null : result};
+      var json = JSON.stringify(payload);
+      if (json.length > 6000) json = JSON.stringify({truncated:true,preview:json.slice(0,5500)});
+      return json;
     }
 
     // ==================== CHAT ====================
     async function sendMessage(userText) {
       if (!userText.trim() || isProcessing) return;
-      if (!config || !config.apiKey) { showConfigWarning(); return; }
+      if (!isDesktopTransportAvailable()) { showDesktopWarning(); return; }
+      if (!config || !hasAuthKey) { showConfigWarning(); return; }
 
       isProcessing = true; updateSendBtn();
       displayMessage('user', userText);
@@ -953,27 +1238,30 @@
       var thinkingEl = showThinking();
       try {
         var maxRounds = 10, round = 0;
-        var response = await callOpenAI(messages);
+        var response = await callGigaChat(messages);
         var allActions = [];
-        while (round < maxRounds) {
+        while (true) {
           var choice = response.choices && response.choices[0];
           if (!choice) throw new Error('No response');
           var am = choice.message;
-          if (am.tool_calls && am.tool_calls.length > 0) {
-            var asstMsg = {role:'assistant',content:am.content||null,tool_calls:am.tool_calls};
-            if(am.reasoning_content) asstMsg.reasoning_content = am.reasoning_content;
+          if (!am) throw new Error('GigaChat returned an empty message.');
+          if (choice.finish_reason === 'error') throw new Error('GigaChat returned invalid function arguments.');
+          if (choice.finish_reason === 'blacklist') throw new Error('GigaChat did not accept this request.');
+          if (choice.finish_reason === 'length') throw new Error('GigaChat response reached the token limit. Increase Max Tokens.');
+          if (am.function_call) {
+            if (round >= maxRounds) throw new Error('Maximum number of function calls reached.');
+            var args = parseFunctionArguments(am.function_call);
+            var asstMsg = {role:'assistant',content:am.content||'',function_call:{name:am.function_call.name,arguments:args}};
+            if (am.functions_state_id) asstMsg.functions_state_id = am.functions_state_id;
             messages.push(asstMsg);
-            for (var i=0;i<am.tool_calls.length;i++) {
-              var tc=am.tool_calls[i], args={};
-              try{args=JSON.parse(tc.function.arguments);}catch(e){}
-              var result=await executeTool(tc.function.name,args);
-              allActions.push({name:tc.function.name,args:args,result:result});
-              messages.push({role:'tool',tool_call_id:tc.id,content:JSON.stringify(result).slice(0,6000)});
-            }
-            response=await callOpenAI(messages); round++;
+            var result = await executeTool(am.function_call.name,args);
+            allActions.push({name:am.function_call.name,args:args,result:result});
+            messages.push({role:'function',name:am.function_call.name,content:serializeFunctionResult(result)});
+            round++;
+            response = await callGigaChat(messages);
           } else {
             var finalMsg = {role:'assistant',content:am.content};
-            if(am.reasoning_content) finalMsg.reasoning_content = am.reasoning_content;
+            if (am.functions_state_id) finalMsg.functions_state_id = am.functions_state_id;
             messages.push(finalMsg);
             removeThinking(thinkingEl);
             if(allActions.length>0) displayActions(allActions);
@@ -981,8 +1269,11 @@
             break;
           }
         }
-        if(round>=maxRounds){removeThinking(thinkingEl);if(allActions.length>0)displayActions(allActions);displayMessage('assistant','⚠️ Max rounds reached.');}
-      } catch(e) { removeThinking(thinkingEl); displayError(e.message); }
+      } catch(e) {
+        removeThinking(thinkingEl);
+        if (allActions && allActions.length) displayActions(allActions);
+        displayError(e.message);
+      }
       isProcessing=false; updateSendBtn();
       autoNameConversation();
       updateConvSelector();
@@ -1136,8 +1427,9 @@
     }
     function removeThinking(el){if(el&&el.parentNode)el.parentNode.removeChild(el);}
     function showWelcome() {
+      if (!isDesktopTransportAvailable()) { showDesktopWarning(); return; }
       document.getElementById('chat-container').innerHTML=
-        '<div class="welcome"><div class="welcome-icon">🤖</div><h3>AI Assistant</h3>'+
+        '<div class="welcome"><div class="welcome-icon">🤖</div><h3>GigaChat Assistant</h3>'+
         '<p>I can help manage tasks, projects, and tags.<br>Tell me what you need!</p>'+
         '<div class="quick-actions">'+
         '<button class="quick-action" onclick="quickSend(\'Show me my tasks\')">📋 My tasks</button>'+
@@ -1149,7 +1441,12 @@
     function showConfigWarning() {
       document.getElementById('chat-container').innerHTML=
         '<div class="config-warning"><div class="welcome-icon">⚙️</div><h3>Configuration Required</h3>'+
-        '<p>Click the ⚙️ button in the top-right corner to configure your API key.</p></div>';
+        '<p>Click the ⚙️ button in the top-right corner to enter your GigaChat Authorization Key. Super Productivity desktop will request nodeExecution permission.</p></div>';
+    }
+    function showDesktopWarning() {
+      document.getElementById('chat-container').innerHTML=
+        '<div class="config-warning"><div class="welcome-icon">🖥️</div><h3>Desktop Required</h3>'+
+        '<p>This plugin cannot connect to GigaChat on Android or in the web version. Open it in Super Productivity desktop and allow nodeExecution when prompted.</p></div>';
     }
     function showSnack(msg) {
       var c=document.getElementById('chat-container');
@@ -1225,7 +1522,7 @@
     function updateConvSelector() {
       var active = getActiveConv();
       var titleEl = document.getElementById('conv-selector-title');
-      titleEl.textContent = active ? active.title : 'AI Assistant';
+      titleEl.textContent = active ? active.title : 'GigaChat Assistant';
     }
 
     // ==================== INIT ====================
@@ -1234,7 +1531,9 @@
       var sendBtn=document.getElementById('send-btn');
       var settingsBtn=document.getElementById('settings-btn');
       var settingsSave=document.getElementById('settings-save');
+      var settingsTest=document.getElementById('settings-test');
       var settingsCancel=document.getElementById('settings-cancel');
+      var authKeyInput=document.getElementById('cfg-authKey');
       var convSelector=document.getElementById('conv-selector');
       var newConvBtn=document.getElementById('new-conv-btn');
       var convDropdown=document.getElementById('conv-dropdown');
@@ -1247,6 +1546,20 @@
       sendBtn.addEventListener('click',function(){var t=input.value;if(t.trim()){sendMessage(t);input.value='';autoResize();}});
       settingsBtn.addEventListener('click',openSettings);
       settingsSave.addEventListener('click',doSaveSettings);
+      settingsTest.addEventListener('click',function() {
+        if (settingsCheckTimer) clearTimeout(settingsCheckTimer);
+        checkSettingsKey(true).catch(function(e) { setSettingsStatus(e.message); });
+      });
+      authKeyInput.addEventListener('input',function() {
+        if (settingsCheckTimer) clearTimeout(settingsCheckTimer);
+        settingsVerified = null;
+        availableModels = [];
+        renderModelOptions([], null);
+        setSettingsStatus('Checking key and loading available models…');
+        settingsCheckTimer = setTimeout(function() {
+          checkSettingsKey(false).catch(function() {});
+        }, 600);
+      });
       settingsCancel.addEventListener('click',closeSettings);
       document.getElementById('settings-overlay').addEventListener('click',function(e){
         if(e.target===this)closeSettings();
@@ -1307,13 +1620,16 @@
 
     async function initPlugin() {
       setupEventListeners();
+      try { await migrateLegacyData(); }
+      catch (e) { console.warn('[AI] Could not migrate old synced data.'); }
       var hasConfig = await loadConfig();
+      try { hasAuthKey = !!(await getSecretBridge().get()); }
+      catch (e) { hasAuthKey = false; }
       updateModelBadge();
-
-      // Migrate old single-conversation format if needed
-      await migrateOldFormat();
-
-      if (!hasConfig) {
+      if (!isDesktopTransportAvailable()) {
+        showDesktopWarning();
+        updateConvSelector();
+      } else if (!hasConfig || !hasAuthKey) {
         showConfigWarning();
         updateConvSelector();
       } else {

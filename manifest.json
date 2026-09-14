@@ -1,13 +1,14 @@
 {
-  "name": "AI Assistant",
+  "name": "GigaChat Assistant",
   "id": "ai-assistant",
   "manifestVersion": 1,
-  "version": "1.7.0",
-  "minSupVersion": "13.0.0",
-  "description": "OpenAI-powered AI assistant that can manage your tasks, projects, and tags via natural language.",
+  "version": "2.0.4",
+  "minSupVersion": "18.13.1",
+  "description": "GigaChat assistant for managing tasks, projects, and tags in Super Productivity desktop.",
   "author": "Community",
   "hooks": ["taskComplete", "currentTaskChange"],
   "permissions": [
+    "nodeExecution",
     "getTasks",
     "getArchivedTasks",
     "getCurrentContextTasks",

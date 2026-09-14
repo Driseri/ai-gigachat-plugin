@@ -15,6 +15,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Extract version from manifest.json
         id: version
         run: |
@@ -31,15 +36,17 @@ jobs:
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Test GigaChat integration
+        run: node --test tests/gigachat.test.cjs
+
       - name: Create plugin package
         if: steps.check_tag.outputs.exists == 'false'
         run: |
-          zip -r ai-assistant-plugin.zip \
+          zip -r gigachat-assistant-plugin.zip \
             manifest.json \
             index.html \
             plugin.js \
-            icon.svg \
-            README.md
+            icon.svg
 
       - name: Create GitHub Release
         if: steps.check_tag.outputs.exists == 'false'
@@ -48,16 +55,12 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: Release v${{ steps.version.outputs.version }}
           body: |
-            ## AI Assistant Plugin v${{ steps.version.outputs.version }}
-            
-            ### Installation
-            1. Download `ai-assistant-plugin.zip`
-            2. In Super Productivity, go to Settings → Plugins
-            3. Click "Install from file" and select the downloaded zip
-            
-            ### Changes
-            See [commit history](https://github.com/${{ github.repository }}/commits/master) for details.
-          files: ai-assistant-plugin.zip
+            GigaChat AI assistant for Super Productivity desktop. Manage tasks, projects, tags and timers with a personal GigaChat API key (`GIGACHAT_API_PERS`). The plugin checks the key and loads available chat models automatically.
+
+            **Requires Super Productivity desktop 18.13.1+** and consent for `nodeExecution`. Android and web versions are not supported.
+
+            Download `gigachat-assistant-plugin.zip`, then open **Settings → Plugins → Choose Plugin File** in Super Productivity. See the [README](https://github.com/${{ github.repository }}#readme) for setup, screenshots and troubleshooting.
+          files: gigachat-assistant-plugin.zip
           draft: false
           prerelease: false
         env:
